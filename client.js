@@ -141,8 +141,10 @@ window.__ModuleLoader__.load({
     }
 
     function t(key, vars) {
-      const found = dict === null ? undefined : lookup(dict, key)
-      let text = found === undefined ? lookup(FALLBACK, key) : found
+      // The dictionary nests by section (ui.tier.low); the built-in copy is a flat dotted map, so
+      // it is looked up by the full key rather than walked.
+      let text = dict === null ? undefined : lookup(dict, key)
+      if (text === undefined && Object.prototype.hasOwnProperty.call(FALLBACK, key)) text = FALLBACK[key]
       if (text === undefined) text = key
       if (vars === undefined || vars === null) return text
       return text.replace(/\{(\w+)\}/g, (whole, name) => (vars[name] === undefined ? whole : String(vars[name])))
