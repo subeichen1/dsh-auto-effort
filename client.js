@@ -157,7 +157,8 @@ window.__ModuleLoader__.load({
         ? navigator.language.toLowerCase().split('-')[0]
         : 'en'
       const lang = /^[a-z]{2}$/.test(tag) ? tag : 'en'
-      fetch(LOCALE_URL + lang + '.json', { cache: 'no-store' })
+      // The route sends Cache-Control: public, max-age=300, so let the browser keep it.
+      fetch(LOCALE_URL + lang + '.json')
         .then((res) => (res.ok ? res.json() : null))
         .then((json) => {
           if (json !== null && typeof json === 'object' && json.ui !== null && typeof json.ui === 'object') {
