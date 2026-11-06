@@ -1,0 +1,24 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  node:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # engines says >=18.17; the harness ships Node 24, so cover the floor and the current LTS.
+        node: ['20', '22', '24']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      # No dependencies: the plugin imports node builtins only, so there is nothing to install.
+      - run: node --check index.js
+      - run: node --check client.js
+      - run: node --test

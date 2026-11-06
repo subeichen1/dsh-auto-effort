@@ -1,0 +1,69 @@
+{
+  "meta": {
+    "title": "自动思考强度",
+    "description": "按任务难度自动调节每轮请求的思考强度（reasoning effort），保留当前模型，适配喜鹊（Magpie）等第三方模型。"
+  },
+  "ui": {
+    "tier": {
+      "low": "AUTO · 低",
+      "high": "AUTO · 高",
+      "max": "AUTO · MAX",
+      "short": {
+        "low": "低",
+        "high": "高",
+        "max": "MAX"
+      }
+    },
+    "state": {
+      "offline": "AUTO · 离线",
+      "pending": "AUTO · 待判定",
+      "unsupported": "AUTO · 不支持",
+      "deferred": "AUTO · 已指定",
+      "writeError": "AUTO · 切换失败",
+      "manual": "手动"
+    },
+    "toast": {
+      "raise": "⤴ 升档 · ",
+      "adjust": "↩ 调整 · "
+    },
+    "panel": {
+      "title": "自动思考强度 · 最近判定",
+      "empty": "本会话还没有判定记录",
+      "global": "全局开关，影响所有会话"
+    },
+    "hint": {
+      "raised": "该模型最低只到 {effort}",
+      "capped": "该模型最高只到 {effort}",
+      "deferred": "本轮请求已自带 reasoningEffort={effort}，按 respectExplicit 保持原样",
+      "writeError": "切换失败：宿主拒绝了这次写入（跨站或非 JSON），3 秒后恢复显示",
+      "offline": "自动思考强度：宿主路由不可达",
+      "manual": "手动 · 点击恢复 Auto",
+      "pending": "自动 · 等待本轮判定",
+      "auto": "自动 · 点击切到手动",
+      "noEffort": "该模型未声明 reasoning effort",
+      "turn": "本轮 {tier} → {effort}",
+      "model": "{provider}/{model}"
+    },
+    "cell": {
+      "unsupported": "不支持",
+      "none": "—"
+    },
+    "reason": {
+      "content": "内容判断",
+      "short": "短任务",
+      "greeting": "寒暄",
+      "regenerate": "检测到重试·升档",
+      "hard-retry": "连续出错·升档",
+      "correction": "纠正·升档",
+      "intent_force": "用户要求深入",
+      "intent_inherit": "保持上轮",
+      "intent_exclude": "用户要求从简",
+      "continue": "继续上轮",
+      "remote": "远程判定",
+      "no-task": "无任务文本",
+      "empty": "空任务",
+      "no-matching-effort": "无匹配档位",
+      "unsupported": "模型不支持"
+    }
+  }
+}

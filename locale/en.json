@@ -1,0 +1,69 @@
+{
+  "meta": {
+    "title": "Auto thinking effort",
+    "description": "Sets the reasoning effort of every request from the task at hand while keeping the current model, including third-party models such as Magpie."
+  },
+  "ui": {
+    "tier": {
+      "low": "AUTO · LOW",
+      "high": "AUTO · HIGH",
+      "max": "AUTO · MAX",
+      "short": {
+        "low": "LOW",
+        "high": "HIGH",
+        "max": "MAX"
+      }
+    },
+    "state": {
+      "offline": "AUTO · offline",
+      "pending": "AUTO · pending",
+      "unsupported": "AUTO · unsupported",
+      "deferred": "AUTO · preset",
+      "writeError": "AUTO · switch failed",
+      "manual": "Manual"
+    },
+    "toast": {
+      "raise": "⤴ raised · ",
+      "adjust": "↩ adjusted · "
+    },
+    "panel": {
+      "title": "Auto thinking effort · recent verdicts",
+      "empty": "No verdict for this session yet",
+      "global": "global switch, applies to every session"
+    },
+    "hint": {
+      "raised": "This model bottoms out at {effort}",
+      "capped": "This model tops out at {effort}",
+      "deferred": "This request already carries reasoningEffort={effort}; respectExplicit leaves it alone",
+      "writeError": "Switch failed: the host refused the write (cross-site or non-JSON). Restoring in 3s",
+      "offline": "Auto thinking effort: host route unreachable",
+      "manual": "Manual · click to resume Auto",
+      "pending": "Auto · waiting for this turn's verdict",
+      "auto": "Auto · click to switch to manual",
+      "noEffort": "This model declares no reasoning effort",
+      "turn": "This turn {tier} → {effort}",
+      "model": "{provider}/{model}"
+    },
+    "cell": {
+      "unsupported": "n/a",
+      "none": "—"
+    },
+    "reason": {
+      "content": "content",
+      "short": "short task",
+      "greeting": "greeting",
+      "regenerate": "resent · escalated",
+      "hard-retry": "repeated failure · escalated",
+      "correction": "correction · escalated",
+      "intent_force": "asked to go deeper",
+      "intent_inherit": "kept from last turn",
+      "intent_exclude": "asked to keep it short",
+      "continue": "continues last turn",
+      "remote": "remote judge",
+      "no-task": "no task text",
+      "empty": "empty task",
+      "no-matching-effort": "no matching level",
+      "unsupported": "model has no efforts"
+    }
+  }
+}

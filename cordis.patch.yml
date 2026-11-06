@@ -1,0 +1,3 @@
+- insert:
+    - id: auto-effort
+      name: 'dsh-auto-effort'

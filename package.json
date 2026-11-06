@@ -1,0 +1,48 @@
+{
+  "name": "dsh-auto-effort",
+  "version": "1.0.0",
+  "description": "Per-turn thinking-effort routing that also works with Magpie models",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "test": "node --test"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "engines": {
+    "node": ">=18.17"
+  },
+  "author": "dsh-auto-effort contributors",
+  "private": true,
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "reasoning-effort",
+    "magpie"
+  ],
+  "license": "MIT"
+}
