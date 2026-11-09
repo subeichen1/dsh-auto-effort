@@ -90,6 +90,7 @@ CI 会检查：条目数 ≤3、`dsh.bundle` 存在、仓库满 1 天、YAML 与
 
 - [x] 代码、`dsh.bundle`、`cordis.patch.yml`、客户端、图标、测试（21 项）
 - [x] `npm pack` 内容核对（9 个文件，26 KB）
-- [ ] GitHub 仓库与 `dsh-plugin` topic
-- [ ] npm 发布
-- [ ] 目录 PR（仓库满 1 天后）
+- [x] GitHub 仓库：https://github.com/subeichen1/dsh-auto-effort（已推 `main`，已加 `dsh-plugin` topic）
+- [x] 目录 PR：[awesome-dsh-plugin#13567](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/13567)
+- [ ] npm 发布（等待账号 2FA 验证码或 bypass token）
+- [ ] 目录 PR 合并（仓库创建满 1 天后 gate 自动放行）
