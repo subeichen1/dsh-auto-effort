@@ -1,5 +1,10 @@
 # dsh-auto-effort · 自动思考强度
 
+> **English:** per-turn reasoning-effort routing for DeepSeek Harness. It keeps the request's
+> provider/model and only sets `reasoningEffort` to a level that model actually declares, so
+> Magpie and other OpenAI-compatible providers work too. Install:
+> `dsh plugin --profile web add dsh-auto-effort`.
+
 按每一轮任务自动调节 **思考强度（reasoning effort）** 的 DSH 插件。它保留了原插件
 `dsh-router-laya` 的交互（输入框旁的档位胶囊、自动/手动切换、最近判定浮层），但工作方式不同：
 
@@ -136,16 +141,28 @@ claim → request → HTTP 路由全链路：工具输出过滤、续跑继承�
 
 ## 安装
 
-本插件以本地 bundle 形式安装，当前机器上的实际位置：
+需要 DSH 0.2.x（在 0.2.2-rc.1 上验证）。
 
-1. 源码目录：`C:\Users\18460\Desktop\项目\自动调节思考强度\dsh-auto-effort`。
-2. profile `C:\Users\18460\.dsh\profiles\desktop\package.json` 的依赖：
-   `"dsh-auto-effort": "file:../../../Desktop/项目/自动调节思考强度/dsh-auto-effort"`。
-3. 同一文件的 `dsh.profile.bundles` 中已加入 `"dsh-auto-effort"`。
-4. `profiles/desktop/node_modules/dsh-auto-effort` 是指向源码目录的目录联接（junction）；
-   改源码即生效，不需要复制。
-5. 新增 bundle 后需要一次重载：Web 模板启用 HMR 时改动 `cordis.patch.yml` 即可重新组合；
-   否则重启 DSH。浏览器端首次加载后若没看到胶囊，刷新一次页面（Ctrl+R）。
+**从插件市场安装**：打开 插件 → 市场，搜索「自动思考强度」或 `dsh-auto-effort`，一键安装。
+
+**命令行安装**（npm 包发布后）：
+
+```sh
+dsh plugin --profile web add dsh-auto-effort
+```
+
+**直接从 GitHub 安装**：
+
+```sh
+dsh plugin --profile web add github:subeichen1/dsh-auto-effort
+```
+
+装完按宿主提示重启，或刷新页面（Ctrl+R）。输入框右侧出现 `AUTO · 待判定` 胶囊即生效；
+没有出现时先在 插件 页确认 `dsh-auto-effort` 已启用。
+
+本地开发：把仓库目录联接（junction / symlink）到 profile 的
+`node_modules/dsh-auto-effort`，或在 profile 的 `package.json` 里用
+`"dsh-auto-effort": "file:<绝对路径>"` 依赖并加入 `dsh.profile.bundles`。
 
 ## 与 dsh-router-laya 的区别
 
