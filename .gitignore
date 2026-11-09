@@ -5,3 +5,4 @@ node_modules/
 
 # 审计/调试截图（12 张，约 37MB），不属于插件源码
 .dsh-pilot/
+*.tgz
