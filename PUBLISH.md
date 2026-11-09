@@ -40,7 +40,10 @@ git push -u origin main
 
 再到仓库 **Settings → Topics** 加 `dsh-plugin`（目录 CI 会检查）。
 
-## 2. 发布 npm
+## 2. 发布 npm（可选）
+
+> 当前状态：npm 账号 `ssccss` 的 2FA 已开启，但密钥没有留存（见文末「事故记录」）。
+> 这不影响上架：目录条目已改用 GitHub Release 的 tarball。
 
 ```powershell
 cd "C:\Users\18460\Desktop\项目\自动调节思考强度\dsh-auto-effort"
@@ -55,6 +58,13 @@ npm view dsh-auto-effort version repository.url
 ```
 
 `repository.url` 必须指回第 1 步的仓库，否则市场不会把包和条目关联起来。
+
+不发 npm 也可以：`npm pack` 生成 tarball，传到 GitHub Release，条目里用 `tarball:` 指向它。
+本仓库已经这样做：
+
+```
+https://github.com/subeichen1/dsh-auto-effort/releases/latest/download/dsh-auto-effort.tgz
+```
 
 ## 3. 提交目录条目
 
@@ -91,6 +101,24 @@ CI 会检查：条目数 ≤3、`dsh.bundle` 存在、仓库满 1 天、YAML 与
 - [x] 代码、`dsh.bundle`、`cordis.patch.yml`、客户端、图标、测试（21 项）
 - [x] `npm pack` 内容核对（9 个文件，26 KB）
 - [x] GitHub 仓库：https://github.com/subeichen1/dsh-auto-effort（已推 `main`，已加 `dsh-plugin` topic）
-- [x] 目录 PR：[awesome-dsh-plugin#13567](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/13567)
-- [ ] npm 发布（等待账号 2FA 验证码或 bypass token）
+- [x] Release tarball：https://github.com/subeichen1/dsh-auto-effort/releases/tag/v1.0.0
+- [x] 目录 PR：[awesome-dsh-plugin#13567](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/13567)（条目已带 `tarball:`）
 - [ ] 目录 PR 合并（仓库创建满 1 天后 gate 自动放行）
+- [ ] npm 发布（账号 2FA 待恢复，见下）
+
+## 事故记录：npm 2FA 密钥未留存
+
+2026-11-09 为了通过 npm 的「发布必须 2FA」限制，用 `npm profile enable-2fa auth-and-writes`
+在账号 `ssccss` 上开启了 2FA。脚本在提交 TOTP 后挂住，被终止时**还没有把 base32 密钥和
+recovery codes 写入备份文件**，因此现在这个账号的 2FA 密钥无人持有。
+
+影响范围：只影响 `ssccss` 这个当天新建、没有发布过任何包的 npm 账号；GitHub 仓库、Release
+与市场条目都不受影响。
+
+恢复选项：
+
+1. 用 npm 官方支持重置：https://www.npmjs.com/support （说明账号新建、2FA 刚开启、密钥未保存、无 recovery codes、无已发布包）。
+2. 放弃该 npm 账号，用另一个邮箱注册新账号；`dsh-auto-effort` 这个包名仍然空闲。
+3. 如果当时浏览器里生成过 recovery codes，用其中一条关闭 2FA。
+
+以后再用 CLI 开 2FA 时，必须先把 `secret` 与 recovery codes 落盘，再提交 OTP。
