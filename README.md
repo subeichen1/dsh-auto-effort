@@ -14,54 +14,63 @@
   **5 分钟**（`MODEL_INFO_TTL_MS`），不是每轮都问一次宿主。
 - 不再依赖 842 MB 的本地 Python 判定服务，判定是纯 JS 的确定性规则，零额外进程。
 
-## 档位与强度映射
+## 自动分档（适配每个模型的档位数）
 
-判定结果只有三档：`low`（低）/ `high`（高）/ `max`（MAX）。每档有一份偏好顺序，取该模型
-声明列表中第一个命中的强度；都不命中时按 pi-ai 的强度序号取最近的一档。若模型的强度 id 完全
-不在 pi-ai 的词汇里（宿主把它们称为 adapter-owned opaque string，例如 `none/thinking/deep`），
-则退回按**声明顺序**取值：数组第一个给 low、最后一个给 max、中间给 high——声明顺序即由弱到强。
+插件不维护固定的 low/high/max 三档，而是每次读取当前模型真正声明的强度列表
+`llm.resolveModelInfo().reasoning.efforts`，按声明数量 **N** 自动等分：
 
-| 档位 | 偏好顺序 |
-| --- | --- |
-| low | low → minimal → medium → high → xhigh → max → off |
-| high | high → medium → xhigh → max → low → minimal → off |
-| max | max → xhigh → high → medium → low → minimal → off |
+```text
+levels = 模型声明的 efforts（按 off → minimal → low → medium → high → xhigh → max 排序，默认排除 off）
+index  = min(N - 1, floor(score / 100 * N))
+effort = levels[index]
+```
 
-举例（均为 `cordis.patch.yml` 中已声明的喜鹊模型）：
+- **N = 1**：永远用该模型唯一的档位。
+- **N = 2**：0–49 第一档，50–100 第二档。
+- **N = 3**：0–33 / 34–66 / 67–100。
+- **N = 4**：0–24 / 25–49 / 50–74 / 75–100。
+- **N = 6**：约 0–16 / 17–33 / 34–49 / 50–66 / 67–83 / 84–100。
 
-| 模型 | 声明的强度 | low | high | max |
-| --- | --- | --- | --- | --- |
-| `group/1` | xhigh, max | xhigh | xhigh | max |
-| `group/2` | low, high | low | high | high |
-| `trae-cn/*` | low, high, xhigh | low | high | xhigh |
-| `workbuddy/hy4free` | high | high | high | high |
+例如同一个任务（score ≈ 59）在 `group/1`（`xhigh,max`，2 档）上是 `max`，在 `group/2`
+（`low,high,xhigh,max`，4 档）上是 `xhigh`，在 `qoder/gfmodel`（`high,max`，2 档）上是 `max`。
+档位少的模型不会被硬塞一个不存在的值，档位多的模型会真正用到中间档。
 
-模型的声明跨度不足以表达某一档时（例如 `group/1` 没有 `low`），胶囊会直接标出实际强度
-——`AUTO · 低 → xhigh`——悬停提示与浮层说明「该模型最低只到 xhigh」，不会把「低档」当成
-真的低强度；反向（模型的最高档低于该档）同理显示「该模型最高只到 …」。
-
-模型的 `reasoning` 元数据缺失或强度列表为空时，请求保持原样，胶囊显示「AUTO · 不支持」。
+模型的 `reasoning` 元数据缺失或强度列表为空时，请求完全不动，胶囊显示「AUTO · 不支持」。
+自定义 OpenAI-compatible 模型只要在 DSH 的 `llm-pi-ai` 配置里写了 `reasoningEfforts`，就会自动
+进入同一套分档逻辑；没写就安全跳过。
 
 ## 判定逻辑（纯 JS，<1ms）
 
 判定只读取 **用户自己发的那条消息**：工具结果、注入的上下文也会经过同一个 inbox，但它们
 不参与判定，否则一段报错日志或文件内容就能决定思考强度。
 
-1. **重试 / 纠正**：与上一轮文本相同 → 升一档；出现「又错了 / 还是不行 / 第三次」→ MAX；
-   出现「不对 / 重新 / 换个」等 → 在上一轮档位上升一档。
-2. **显式意图**：「仔细 / 深入 / 一步一步 / step by step」→ 至少 high；「最高强度 / 彻底」→ MAX；
-   「简短 / 一句话 / quickly」是**封顶**而不是直接判 low：内容信号仍然打分，只是不会给到 MAX。
-3. **内容打分**：长度、代码块、报错/堆栈、重构/架构/调试/测试等主题、多个问号、多个文件路径、
-   编号清单累计分数：≥6 → MAX，≥3 → high，否则 low。「整个项目 / 端到端 / 评审 / 设计文档」
-   这类广度信号单独 +3，一句话也能到 high。
-4. **寒暄 / 继续**：寒暄固定 low；「继续」沿用上一轮档位；没有新用户文本的续跑步骤（工具循环、
-   自动继续）沿用本会话上一轮的档位，不会中途掉到 low。
+总分是 `clamp(0, 100)`，由六部分组成：
 
-可选配置 `judgeUrl` 时，先把同样的 `{task, prev_tier, prev_task, session_id}` POST 给
-Laya 判定服务（默认 1 秒超时，`judgeTimeoutMs` 可调），失败则回落到本地规则；连续 3 次失败后
+1. **文本长度 0–20**：<80 字 0；80–199 +4；200–499 +8；500–1199 +12；1200–2999 +16；≥3000 +20。
+2. **代码/堆栈 0–20**：1 个代码块 <20 行 +8；20–60 行 +14；>60 行或 ≥2 块 +20。
+3. **报错信号 0–15**：报错词 +8；`Traceback` / `Caused by` / `npm ERR!` / 堆栈帧 +7。
+4. **复杂度关键词 0–35**：20/个（整个项目、从零实现、架构设计、分布式、安全审计、性能优化、
+   迁移方案、端到端、生产环境、源码…），10/个（重构、优化、排查、调试、分析、修复、并发、
+   数据库、算法、协议、部署、编译…），4/个（实现、设计、方案、对比、示例、脚本、文档、配置、
+   接口、组件、页面、样式…）。
+5. **任务结构 0–10**：多个问号、编号清单、多个文件路径分别加分。
+6. **上下文/重试 0–20**：同一任务重发 +15；「不对 / 还是不行 / 又错了」+10；
+   「第三次 / 还是错 / 又报错」直接 100；「继续 / 接着做」继承上一轮分数。
+
+强制规则最后覆盖：`仔细分析 / 全面 / 彻底 / 从零实现` → 至少 85；`简单回答 / 一句话 / 很短 /
+只要结论` → 最多 20；`你好 / 谢谢 / 收到` → 0–5。
+
+可选配置 `judgeUrl` 时，先把同样的 `{task, prev_score, prev_task, session_id}` POST 给兼容 Laya
+协议的判定服务（默认 1 秒超时，`judgeTimeoutMs` 可调），失败则回落到本地规则；连续 3 次失败后
 暂停调用 60 秒，避免判定服务挂掉时每一轮都白等超时。
 
 超过 4000 字的任务只保留开头与结尾各一段（尾部通常是真正的问题），再送去判定与记录。
+
+**写入时机**：DSH 0.2.2-rc.1 的 `agent/request` 只允许读取，不能再改 `reasoningEffort`，否则
+`prepareRequest` 会在发请求前抛 `after step preparation fixed`。插件改为在
+`agent/inbox/claimed`（`preStep` 读取 `model.current()` 之前）同步调用
+`agent.model.select({ provider, model, reasoningEffort })` 写入下一步的选择；`agent/request`
+不再改写任何字段。这也是 1.0.0 在开启后模型回复报错的根因修复。
 
 ## 配置
 
@@ -73,25 +82,23 @@ Laya 判定服务（默认 1 秒超时，`judgeTimeoutMs` 可调），失败则�
     mode: auto            # auto | manual，初始模式；之后由胶囊切换并持久化（见下方状态文件）
     global: true          # 覆盖所有会话（含子代理）；false 时仅覆盖本插件挂载的 agent
     respectExplicit: false # true 时尊重请求里已有的 reasoningEffort（见下方警告）
-    judgeUrl: ""          # 可选：Laya 判定服务的 /judge 地址（见下方隐私说明）
+    judgeUrl: ""          # 可选：兼容 Laya 协议的判定服务 /judge 地址（见下方隐私说明）
     judgeTimeoutMs: 1000  # 可选：远程判定超时（100–10000ms）
-    efforts:              # 可选：按档位改偏好顺序
-      low: [low, minimal]
-      high: [high, medium]
-      max: [max, xhigh]
-    judge:                # 可选：判定规则的可调项，缺省值如下
-      scoreHigh: 3        # 累计分 ≥ 此值 → high
-      scoreMax: 6         # 累计分 ≥ 此值 → max
-      lengthTiers: [160, 500, 1200]   # 长度加分档位：+1 / +1 / +2
-      judgeMaxChars: 4000 # 超过此长度只保留开头与结尾
-      hardKeywords: []    # 额外的高难度关键词（按纯文本匹配，不需要转义）
-      broadKeywords: []   # 额外的广度关键词（+3）
+    includeOff: false     # true 时把 off 也算作一个档位（默认 false，off = 不思考，不算强度）
+    judge:                # 可选：0–100 评分权重的可调项
+      maxChars: 4000      # 超过此长度只保留开头与结尾
+      extremeKeyword: 20  # 每个广度关键词的分数（封顶 35）
+      hardKeyword: 10     # 每个高难度关键词的分数
+      mediumKeyword: 4    # 每个中等关键词的分数
+      regenerate: 15      # 同一任务重发的加分
+      correction: 10      # 纠正词的加分
+      forceHigh: 85       # 「仔细分析 / 全面」类指令的最低分
 ```
 
 模式文件位置：`$DSH_HOME/auto-effort-mode.json`，未设置 `DSH_HOME` 时退回 `~/.dsh/auto-effort-mode.json`；
 写入走「临时文件 + rename」，中途被杀不会留下半截文件。
 
-> **`judgeUrl` 会把任务文本发出去**：请求体包含 `task`（最多 `judgeMaxChars` 字）、上一轮任务
+> **`judgeUrl` 会把任务文本发出去**：请求体包含 `task`（最多 `maxChars` 字）、上一轮任务
 > `prev_task` 与会话 id。默认关闭（空字符串）。开启时请使用本机或可信地址，并注意非 `https` 的
 > 地址会在日志里打印一条 `warn`：文本将以明文离开本机，且目前不做脱敏。
 
@@ -119,8 +126,8 @@ Content-Type 校验：
 | `/auto-effort/mode` | GET / POST | 读/写模式；POST 要求同源 + `application/json`，body >4KB 回 413，非法值回 400 |
 | `/auto-effort/locale/<lang>.json` | GET | 胶囊文案词典（`zh` / `en`），可缓存 5 分钟 |
 
-`/state` 的判定行只带 `tier/effort/provider/model/task 前 120 字/触发原因/标注`，模型声明的强度
-列表在顶层 `models` 里按 `provider/model` 出现一次，不随每行重复。
+`/state` 的判定行带 `score/tier/effort/levelIndex/levelCount/provider/model/task 前 120 字/触发原因/标注`，
+模型声明的强度列表在顶层 `models` 里按 `provider/model` 出现一次，不随每行重复。
 
 前端文案来自 `locale/*.json` 的 `ui` 段（按 `navigator.language` 取主语言，缺词条时用内置中文兜底），
 代码里不再写死中文。
@@ -132,10 +139,11 @@ cd dsh-auto-effort
 node --test
 ```
 
-三组用例：`test/judge.test.js`（判定规则与截断）、`test/select.test.js`（档位→强度选择、
-`raised/capped` 标注、opaque 词表的顺序回退）、`test/plugin.test.js`（用 mock ctx 跑
-claim → request → HTTP 路由全链路：工具输出过滤、续跑继承、让行、`/mode` 的跨站/非 JSON/超长
-拒绝、`/state` 的 host 校验与 `?session=` 过滤、`/locale` 的词典与路径穿越拒绝）。
+三组用例：`test/judge.test.js`（0–100 评分规则与截断）、`test/select.test.js`（按模型档位数量
+等分、2/3/4 档边界、off 排除）、`test/plugin.test.js`（用 mock ctx 跑 claim → HTTP 路由全链路：
+工具输出过滤、按模型档位写入 `agent.model.select`、四档模型、让行、无 reasoning 跳过、
+`/mode` 的跨站/非 JSON/超长拒绝、`/state` 的 host 校验与 `?session=` 过滤、`/locale` 的词典与
+路径穿越拒绝）。
 用例把 `USERPROFILE` 指到临时目录，不会读写真实的状态文件。CI（`.github/workflows/test.yml`）
 在 Node 20 / 22 / 24 上跑同一条命令。
 

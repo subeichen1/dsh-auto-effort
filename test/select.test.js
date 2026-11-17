@@ -1,37 +1,66 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { chooseEffort, effortMapping } from '../index.js'
+import { buildEffortLadder, chooseEffortForScore, chooseEffort, effortMapping } from '../index.js'
 
-test('a tier takes the first effort it declares, in preference order', () => {
+const ids = (efforts) => buildEffortLadder(efforts.map((id) => ({ id }))).map((entry) => entry.id)
+
+test('the ladder follows the model declaration, weakest to strongest', () => {
+  assert.deepEqual(ids(['max', 'xhigh']), ['xhigh', 'max'])
+  assert.deepEqual(ids(['low', 'high', 'xhigh', 'max']), ['low', 'high', 'xhigh', 'max'])
+  assert.deepEqual(ids(['off', 'low', 'high']), ['low', 'high'])
+  assert.deepEqual(ids(['high']), ['high'])
+  assert.deepEqual(ids([]), [])
+})
+
+test('off is excluded from the work ladder unless explicitly allowed', () => {
+  assert.deepEqual(ids(['off', 'low', 'high']), ['low', 'high'])
+  assert.deepEqual(
+    buildEffortLadder([{ id: 'off' }, { id: 'low' }], { includeOff: true }).map((entry) => entry.id),
+    ['off', 'low'],
+  )
+})
+
+test('two levels split at the midpoint', () => {
+  const efforts = [{ id: 'xhigh' }, { id: 'max' }]
+  assert.equal(chooseEffortForScore(0, efforts).effort, 'xhigh')
+  assert.equal(chooseEffortForScore(49, efforts).effort, 'xhigh')
+  assert.equal(chooseEffortForScore(50, efforts).effort, 'max')
+  assert.equal(chooseEffortForScore(100, efforts).effort, 'max')
+})
+
+test('three levels split into thirds', () => {
+  const efforts = [{ id: 'low' }, { id: 'high' }, { id: 'max' }]
+  assert.equal(chooseEffortForScore(33, efforts).effort, 'low')
+  assert.equal(chooseEffortForScore(34, efforts).effort, 'high')
+  assert.equal(chooseEffortForScore(66, efforts).effort, 'high')
+  assert.equal(chooseEffortForScore(67, efforts).effort, 'max')
+})
+
+test('four levels use every rung', () => {
+  const efforts = [{ id: 'low' }, { id: 'high' }, { id: 'xhigh' }, { id: 'max' }]
+  assert.equal(chooseEffortForScore(24, efforts).effort, 'low')
+  assert.equal(chooseEffortForScore(25, efforts).effort, 'high')
+  assert.equal(chooseEffortForScore(49, efforts).effort, 'high')
+  assert.equal(chooseEffortForScore(50, efforts).effort, 'xhigh')
+  assert.equal(chooseEffortForScore(74, efforts).effort, 'xhigh')
+  assert.equal(chooseEffortForScore(75, efforts).effort, 'max')
+})
+
+test('one level is always the only choice; no level returns null', () => {
+  assert.equal(chooseEffortForScore(0, [{ id: 'high' }]).effort, 'high')
+  assert.equal(chooseEffortForScore(100, [{ id: 'high' }]).effort, 'high')
+  assert.equal(chooseEffortForScore(50, []), null)
+  assert.equal(chooseEffortForScore(50, [{ id: 'off' }]), null)
+})
+
+test('the legacy tier selector still works for old callers', () => {
   assert.equal(chooseEffort('low', ['xhigh', 'max']), 'xhigh')
-  assert.equal(chooseEffort('high', ['low', 'medium', 'high']), 'high')
-  assert.equal(chooseEffort('max', ['off', 'low', 'high', 'max']), 'max')
-})
-
-test('an unrankable vocabulary falls back to the advertised order', () => {
-  // The host calls these ids adapter-owned opaque strings, and the advertised array runs weakest
-  // to strongest, so the ends of the array stand in for low and max.
-  assert.equal(chooseEffort('low', ['turbo']), 'turbo')
-  assert.equal(chooseEffort('max', ['turbo']), 'turbo')
-  assert.equal(chooseEffort('low', ['none', 'thinking', 'deep']), 'none')
-  assert.equal(chooseEffort('high', ['none', 'thinking', 'deep']), 'thinking')
-  assert.equal(chooseEffort('max', ['none', 'thinking', 'deep']), 'deep')
+  assert.equal(chooseEffort('max', ['low', 'high', 'max']), 'max')
   assert.equal(chooseEffort('low', []), null)
-  assert.equal(chooseEffort('low', null), null)
 })
 
-test('overrides replace the preference order', () => {
-  assert.equal(chooseEffort('high', ['low', 'high'], { high: ['low'] }), 'low')
-})
-
-test('without a match the nearest rank wins', () => {
-  assert.equal(chooseEffort('max', ['low', 'minimal']), 'low')
-})
-
-test('the applied effort is reported against the tier it was chosen for', () => {
+test('effortMapping reports whether the legacy tier was raised or capped', () => {
   assert.equal(effortMapping('low', 'xhigh'), 'raised')
   assert.equal(effortMapping('max', 'high'), 'capped')
   assert.equal(effortMapping('high', 'high'), 'exact')
-  assert.equal(effortMapping('low', 'off'), 'capped')
-  assert.equal(effortMapping('low', 'unknown-id'), 'exact')
 })

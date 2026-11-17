@@ -4,16 +4,6 @@
     "description": "按任务难度自动调节每轮请求的思考强度（reasoning effort），保留当前模型，适配喜鹊（Magpie）等第三方模型。"
   },
   "ui": {
-    "tier": {
-      "low": "AUTO · 低",
-      "high": "AUTO · 高",
-      "max": "AUTO · MAX",
-      "short": {
-        "low": "低",
-        "high": "高",
-        "max": "MAX"
-      }
-    },
     "state": {
       "offline": "AUTO · 离线",
       "pending": "AUTO · 待判定",
@@ -32,8 +22,6 @@
       "global": "全局开关，影响所有会话"
     },
     "hint": {
-      "raised": "该模型最低只到 {effort}",
-      "capped": "该模型最高只到 {effort}",
       "deferred": "本轮请求已自带 reasoningEffort={effort}，按 respectExplicit 保持原样",
       "writeError": "切换失败：宿主拒绝了这次写入（跨站或非 JSON），3 秒后恢复显示",
       "offline": "自动思考强度：宿主路由不可达",
@@ -41,7 +29,9 @@
       "pending": "自动 · 等待本轮判定",
       "auto": "自动 · 点击切到手动",
       "noEffort": "该模型未声明 reasoning effort",
-      "turn": "本轮 {tier} → {effort}",
+      "turn": "本轮 {score}/100 → {effort}",
+      "level": "该模型共 {count} 档，当前第 {index} 档",
+      "ladder": "档位：{ladder}",
       "model": "{provider}/{model}"
     },
     "cell": {

@@ -22,9 +22,13 @@ window.__ModuleLoader__.load({
     const HISTORY_LIMIT = 20
     const TASK_CHARS = 34
 
-    const TIER_ORDER = { low: 0, high: 1, max: 2 }
-    const TIER_COLOR = { low: '#3fb950', high: '#d29922', max: '#f85149' }
     const MUTED = '#8b949e'
+    function toneForScore(score) {
+      if (typeof score !== 'number' || !isFinite(score)) return MUTED
+      if (score >= 67) return '#f85149'
+      if (score >= 34) return '#d29922'
+      return '#3fb950'
+    }
 
     /**
      * Chinese copy is the built-in fallback: the dictionary arrives over HTTP, and a chip that
@@ -32,12 +36,6 @@ window.__ModuleLoader__.load({
      * mismatch. Every user-visible string below goes through `t()`, so the dictionary wins.
      */
     const FALLBACK = {
-      'tier.low': 'AUTO · 低',
-      'tier.high': 'AUTO · 高',
-      'tier.max': 'AUTO · MAX',
-      'tier.short.low': '低',
-      'tier.short.high': '高',
-      'tier.short.max': 'MAX',
       'state.offline': 'AUTO · 离线',
       'state.pending': 'AUTO · 待判定',
       'state.unsupported': 'AUTO · 不支持',
@@ -49,8 +47,6 @@ window.__ModuleLoader__.load({
       'panel.title': '自动思考强度 · 最近判定',
       'panel.empty': '本会话还没有判定记录',
       'panel.global': '全局开关，影响所有会话',
-      'hint.raised': '该模型最低只到 {effort}',
-      'hint.capped': '该模型最高只到 {effort}',
       'hint.deferred': '本轮请求已自带 reasoningEffort={effort}，按 respectExplicit 保持原样',
       'hint.writeError': '切换失败：宿主拒绝了这次写入（跨站或非 JSON），3 秒后恢复显示',
       'hint.offline': '自动思考强度：宿主路由不可达',
@@ -58,7 +54,9 @@ window.__ModuleLoader__.load({
       'hint.pending': '自动 · 等待本轮判定',
       'hint.auto': '自动 · 点击切到手动',
       'hint.noEffort': '该模型未声明 reasoning effort',
-      'hint.turn': '本轮 {tier} → {effort}',
+      'hint.turn': '本轮 {score}/100 → {effort}',
+      'hint.level': '该模型共 {count} 档，当前第 {index} 档',
+      'hint.ladder': '档位：{ladder}',
       'hint.model': '{provider}/{model}',
       'cell.unsupported': '不支持',
       'cell.none': '—',
@@ -141,7 +139,7 @@ window.__ModuleLoader__.load({
     }
 
     function t(key, vars) {
-      // The dictionary nests by section (ui.tier.low); the built-in copy is a flat dotted map, so
+      // The dictionary nests by section (ui.state.offline); the built-in copy is a flat dotted map, so
       // it is looked up by the full key rather than walked.
       let text = dict === null ? undefined : lookup(dict, key)
       if (text === undefined && Object.prototype.hasOwnProperty.call(FALLBACK, key)) text = FALLBACK[key]
@@ -273,14 +271,6 @@ window.__ModuleLoader__.load({
       return text === key ? String(triggeredBy) : text
     }
 
-    function mappingText(row) {
-      if (row === null || row === undefined || typeof row.mapping !== 'string' || row.mapping === 'exact') return ''
-      if (row.effort === null || row.effort === undefined) return ''
-      return row.mapping === 'raised'
-        ? t('hint.raised', { effort: row.effort })
-        : t('hint.capped', { effort: row.effort })
-    }
-
     function clockOf(ts) {
       if (typeof ts !== 'number' || !isFinite(ts)) return '--:--'
       const d = new Date(ts * 1000)
@@ -319,13 +309,13 @@ window.__ModuleLoader__.load({
       const latest = rows.length === 0 ? null : rows[rows.length - 1]
       const offline = state.offline
       const manual = state.mode === 'manual'
-      const tier = latest !== null && typeof latest.tier === 'string' ? latest.tier : null
+      const score = latest !== null && typeof latest.score === 'number' && isFinite(latest.score) ? latest.score : null
       const effort = latest !== null && typeof latest.effort === 'string' ? latest.effort : null
+      const levelIndex = latest !== null && typeof latest.levelIndex === 'number' ? latest.levelIndex : null
+      const levelCount = latest !== null && typeof latest.levelCount === 'number' ? latest.levelCount : null
       const unsupported = latest !== null && (latest.note === 'unsupported' || latest.note === 'no-matching-effort')
       const deferred = latest !== null && latest.note === 'explicit'
       const writeError = state.writeError === true
-      const mapping = latest !== null && typeof latest.mapping === 'string' ? latest.mapping : null
-      const mapped = mapping !== null && mapping !== 'exact' && effort !== null && tier !== null
 
       React.useEffect(() => {
         loadDictionary()
@@ -335,16 +325,16 @@ window.__ModuleLoader__.load({
       React.useEffect(() => {
         if (latest === null) return
         const prev = previous.current
-        previous.current = { tier: latest.tier, effort: latest.effort, ts: latest.ts, sessionId }
+        previous.current = { score: latest.score, effort: latest.effort, ts: latest.ts, sessionId }
         if (prev === null || prev.sessionId !== sessionId) return
-        if (prev.tier === latest.tier && prev.effort === latest.effort) return
+        if (prev.score === latest.score && prev.effort === latest.effort) return
         setPopKey((n) => n + 1)
-        const up = TIER_ORDER[latest.tier] > TIER_ORDER[prev.tier]
+        const up = typeof latest.score === 'number' && typeof prev.score === 'number' ? latest.score > prev.score : false
         const text = (up ? t('toast.raise') : t('toast.adjust')) + reasonText(latest.triggered_by)
           + (effort === null ? '' : ' → ' + effort)
         setToast(text)
         setToastOut(false)
-      }, [latest === null ? null : String(latest.ts) + ':' + String(latest.tier) + ':' + String(latest.effort), sessionId])
+      }, [latest === null ? null : String(latest.ts) + ':' + String(latest.score) + ':' + String(latest.effort), sessionId])
 
       React.useEffect(() => {
         if (toast === null) return undefined
@@ -364,29 +354,28 @@ window.__ModuleLoader__.load({
       React.useEffect(() => () => { if (hover.current !== null) clearTimeout(hover.current) }, [])
 
       const nothingYet = !offline && latest === null
-      const color = offline || nothingYet || deferred || writeError ? MUTED : (manual ? null : TIER_COLOR[tier] || MUTED)
-      const tierLabel = tier === null ? '' : t('tier.' + tier)
-      const tierShort = tier === null ? '' : t('tier.short.' + tier)
+      const color = offline || nothingYet || deferred || writeError ? MUTED : (manual ? null : toneForScore(score))
       const text = writeError
         ? t('state.writeError')
         : offline
           ? t('state.offline')
           : manual
-          ? (tier === null ? t('state.manual') : t('state.manual') + ' · ' + tierShort)
+          ? (t('state.manual') + (effort === null ? '' : ' · ' + effort))
           : nothingYet
             ? t('state.pending')
             : unsupported
               ? t('state.unsupported')
               : deferred
                 ? t('state.deferred') + (effort === null ? '' : ' · ' + effort)
-                : mapped
-                  ? (tierLabel || t('state.pending')) + ' → ' + effort
-                  : tierLabel || t('state.pending')
-      const mappingHint = mapping === 'raised'
-        ? t('hint.raised', { effort })
-        : mapping === 'capped'
-          ? t('hint.capped', { effort })
-          : ''
+                : effort === null
+                  ? t('state.pending')
+                  : 'AUTO · ' + effort
+      const levelLine = levelIndex !== null && levelCount !== null && levelCount > 0
+        ? '\n' + t('hint.level', { index: levelIndex + 1, count: levelCount })
+        : ''
+      const ladderLine = latest !== null && Array.isArray(latest.ladder) && latest.ladder.length > 0
+        ? '\n' + t('hint.ladder', { ladder: latest.ladder.join(' → ') })
+        : ''
       const modelLine = latest !== null && latest.model
         ? '\n' + t('hint.model', { provider: latest.provider, model: latest.model })
         : ''
@@ -402,14 +391,15 @@ window.__ModuleLoader__.load({
               ? t('hint.deferred', { effort: effort === null ? '' : effort })
                 + '\n' + t('hint.auto')
               : t('hint.auto') + '\n'
-              + (effort === null ? t('hint.noEffort') : t('hint.turn', { tier, effort }))
-              + (mappingHint === '' ? '' : '\n' + mappingHint)
+              + (effort === null ? t('hint.noEffort') : t('hint.turn', { score: score === null ? '?' : score, effort }))
+              + levelLine
+              + ladderLine
               + modelLine
 
       const classes = ['autoEffortChip']
-      if (!offline && !manual && tier === 'max') classes.push('autoEffortMax')
+      if (!offline && !manual && score !== null && score >= 67) classes.push('autoEffortMax')
 
-      // Re-mounting the chip on every tier change replays the pop animation; a class that is only
+      // Re-mounting the chip on every score change replays the pop animation; a class that is only
       // ever added would animate once and then stay silent for the rest of the session.
       const chip = React.createElement('div', {
         key: 'chip-' + String(popKey),
@@ -443,19 +433,20 @@ window.__ModuleLoader__.load({
               : rows.slice().reverse().map((row, index) => React.createElement('div', {
                 key: String(row.ts) + ':' + String(index),
                 className: 'autoEffortRow',
-                title: mappingText(row) || (row.note === 'explicit' ? t('hint.deferred', { effort: row.effort === null ? '' : row.effort }) : undefined),
+                title: row.note === 'explicit' ? t('hint.deferred', { effort: row.effort === null ? '' : row.effort }) : undefined,
               },
                 React.createElement('span', { className: 'autoEffortTime' }, clockOf(row.ts)),
                 React.createElement('span', {
                   className: 'autoEffortDot',
-                  style: { background: TIER_COLOR[row.tier] || MUTED },
+                  style: { background: toneForScore(row.score) },
                 }),
                 React.createElement('span', { className: 'autoEffortTask' }, clip(row.task)),
                 React.createElement('span', { className: 'autoEffortEffort' },
                   row.effort === null || row.effort === undefined
                     ? (row.note === 'unsupported' ? t('cell.unsupported') : t('cell.none'))
                     : row.effort),
-                React.createElement('span', { className: 'autoEffortWhy' }, reasonText(row.triggered_by)),
+                React.createElement('span', { className: 'autoEffortWhy' },
+                  (typeof row.score === 'number' ? row.score + ' · ' : '') + reasonText(row.triggered_by)),
               )),
           )
         : null

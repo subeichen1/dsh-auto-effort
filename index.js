@@ -1,19 +1,21 @@
 /**
  * dsh-auto-effort — per-turn thinking-effort routing for every model, including Magpie.
  *
- * The original dsh-router-laya swaps the whole provider/model route (deepseek-flash / qwen), so it
- * does nothing in a profile where those providers do not exist. This plugin keeps whatever
- * provider/model the request already carries and only tunes `reasoningEffort` against that model's
- * declared effort vocabulary (`llm.resolveModelInfo().reasoning.efforts`). That makes it work with
- * Magpie models whose ids and effort sets differ per model (xhigh+max, low+high, high only, ...).
+ * The plugin keeps whatever provider/model the turn already uses and only tunes
+ * `reasoningEffort` against that model's declared effort vocabulary
+ * (`llm.resolveModelInfo().reasoning.efforts`). The declared array is treated as an
+ * ordered ladder: two levels are split 50/50, three levels 33/67, four 25/50/75,
+ * and any other count is divided proportionally. Nothing is hard-coded to a model
+ * name, so every model DSH can describe works without a plugin update.
  *
- * A small deterministic judge maps the claimed user message to a tier (low | high | max):
- * intent words, length, code/stack traces, multi-question prompts, correction/retry detection and
- * escalation from the previous turn. An optional `judgeUrl` can delegate the same decision to the
- * Laya HTTP service with the original v2 wire format.
+ * A small deterministic scorer maps the claimed user message to 0–100. It uses
+ * intent words, length, code/stack traces, multi-question prompts, correction/retry
+ * detection and continuation from the previous turn. An optional `judgeUrl` can
+ * pre-score a message with the original Laya v2 wire format; the local score is
+ * always available without a network call.
  *
- * Everything is fail-safe: a missing llm service, an unknown model, a model without reasoning
- * support, or a judge failure all leave the request exactly as its owner configured it.
+ * All failures are fail-safe: a missing llm service, an unknown model, a model
+ * without reasoning support, or a score failure leaves the request untouched.
  */
 
 import { readFileSync, writeFileSync, mkdirSync, renameSync, rmSync } from 'node:fs'
@@ -23,7 +25,7 @@ import { fileURLToPath } from 'node:url'
 
 export const name = 'auto-effort'
 
-/** Node builtins only: this plugin talks to `llm` per request and serves three same-origin routes. */
+/** Node builtins only: this plugin talks to `llm` in the host and serves three same-origin routes. */
 export const inject = []
 
 const LOG_PREFIX = '[auto-effort]'
@@ -46,14 +48,47 @@ const MODEL_INFO_TTL_MS = 5 * 60 * 1000
 const HISTORY_LIMIT = 20
 const SESSION_LIMIT = 40
 
-/** Scoring defaults; a profile may override the numbers and add keywords through Config. */
+/** Scoring defaults; a profile may override any numeric weight or add keywords via Config. */
 export const JUDGE_DEFAULTS = {
-  scoreHigh: 3,
-  scoreMax: 6,
-  lengthTiers: [160, 500, 1200],
-  judgeMaxChars: JUDGE_MAX_CHARS,
-  hardKeywords: [],
-  broadKeywords: [],
+  maxChars: JUDGE_MAX_CHARS,
+  lengthCuts: [80, 200, 500, 1200, 3000],
+  lengthScores: [0, 4, 8, 12, 16, 20],
+  codeSmall: 8,
+  codeMedium: 14,
+  codeLarge: 20,
+  errorWord: 8,
+  stackSignal: 7,
+  extremeKeyword: 20,
+  hardKeyword: 10,
+  mediumKeyword: 4,
+  question2: 2,
+  question4: 4,
+  numbered3: 3,
+  numbered5: 5,
+  files2: 2,
+  files4: 3,
+  regenerate: 15,
+  correction: 10,
+  shortCap: 20,
+  forceHigh: 85,
+  hardRetry: 100,
+  extremeKeywords: [
+    '整个项目', '全项目', '从零实现', '架构设计', '系统设计', '分布式', '高并发',
+    '安全审计', '性能优化', '迁移方案', '多模块', '端到端', '生产环境', '源码',
+    'entire codebase', 'whole repo', 'from scratch', 'distributed system', 'high concurrency',
+    'security audit', 'performance optimization', 'migration plan', 'end-to-end',
+    'production environment', 'mission critical',
+  ],
+  hardKeywords: [
+    '重构', '优化', '排查', '调试', '分析', '修复', '并发', '数据库', '算法', '协议',
+    '部署', '编译', 'refactor', 'optimize', 'debug', 'diagnose', 'fix', 'concurrency',
+    'database', 'algorithm', 'protocol', 'deploy', 'compile',
+  ],
+  mediumKeywords: [
+    '实现', '设计', '方案', '对比', '示例', '脚本', '文档', '配置', '接口', '组件',
+    '页面', '样式', 'implement', 'design', 'plan', 'compare', 'example', 'script',
+    'document', 'config', 'interface', 'component', 'page', 'style',
+  ],
 }
 
 /** pi-ai's own level order; used to rank whatever a model declares. */
@@ -67,7 +102,10 @@ export const EFFORT_RANK = {
   max: 6,
 }
 
-/** Preferred effort id per tier, before intersecting with the model's declared efforts. */
+/**
+ * Legacy tier preference table. It is kept exported so older callers of `chooseEffort`
+ * keep working; the request path uses the score-driven ladder instead.
+ */
 export const TIER_EFFORT_ORDER = {
   low: ['low', 'minimal', 'medium', 'high', 'xhigh', 'max', 'off'],
   high: ['high', 'medium', 'xhigh', 'max', 'low', 'minimal', 'off'],
@@ -85,12 +123,31 @@ function log(message, level) {
   process.stderr.write(`${LOG_PREFIX} ${new Date().toISOString()} ${tag} ${message}\n`)
 }
 
+function clampScore(value) {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return 0
+  return Math.max(0, Math.min(100, Math.round(n)))
+}
+
 function tierOf(value) {
   return TIERS.includes(value) ? value : 'low'
 }
 
 function bump(tier) {
   return tier === 'low' ? 'high' : 'max'
+}
+
+function scoreForTier(tier) {
+  if (tier === 'max') return 90
+  if (tier === 'high') return 55
+  return 15
+}
+
+function tierForScore(score) {
+  const s = clampScore(score)
+  if (s >= 67) return 'max'
+  if (s >= 34) return 'high'
+  return 'low'
 }
 
 function normalize(text) {
@@ -107,37 +164,84 @@ export function clipTask(text, maxChars) {
   return s.slice(0, limit - tail - marker.length) + marker + s.slice(-tail)
 }
 
+function numberOr(value, fallback) {
+  return Number.isFinite(value) && value >= 0 ? value : fallback
+}
+
+function words(value) {
+  return Array.isArray(value) ? value.filter((word) => typeof word === 'string' && word !== '') : []
+}
+
+function numberList(value, fallback) {
+  if (!Array.isArray(value) || value.length !== fallback.length) return fallback.slice()
+  if (!value.every((n) => Number.isFinite(n) && n >= 0)) return fallback.slice()
+  return value.slice()
+}
+
 /** Merge a partial judge config over the defaults; bad values fall back instead of throwing. */
 export function judgeOptions(options) {
   const given = options !== undefined && options !== null && typeof options === 'object' ? options : {}
-  const number = (value, fallback) => (Number.isFinite(value) && value >= 0 ? value : fallback)
-  const lengths = Array.isArray(given.lengthTiers) && given.lengthTiers.length === 3
-    && given.lengthTiers.every((n) => Number.isFinite(n) && n > 0)
-    ? given.lengthTiers
-    : JUDGE_DEFAULTS.lengthTiers
-  const words = (value) => (Array.isArray(value) ? value.filter((w) => typeof w === 'string' && w !== '') : [])
+  const numeric = (value, fallback) => numberOr(value, fallback)
   return {
-    scoreHigh: number(given.scoreHigh, JUDGE_DEFAULTS.scoreHigh),
-    scoreMax: number(given.scoreMax, JUDGE_DEFAULTS.scoreMax),
-    lengthTiers: lengths,
-    judgeMaxChars: number(given.judgeMaxChars, JUDGE_DEFAULTS.judgeMaxChars),
-    hardKeywords: words(given.hardKeywords),
-    broadKeywords: words(given.broadKeywords),
+    maxChars: numeric(given.maxChars, JUDGE_DEFAULTS.maxChars),
+    lengthCuts: numberList(given.lengthCuts || given.lengthTiers, JUDGE_DEFAULTS.lengthCuts),
+    lengthScores: numberList(given.lengthScores, JUDGE_DEFAULTS.lengthScores),
+    codeSmall: numeric(given.codeSmall, JUDGE_DEFAULTS.codeSmall),
+    codeMedium: numeric(given.codeMedium, JUDGE_DEFAULTS.codeMedium),
+    codeLarge: numeric(given.codeLarge, JUDGE_DEFAULTS.codeLarge),
+    errorWord: numeric(given.errorWord, JUDGE_DEFAULTS.errorWord),
+    stackSignal: numeric(given.stackSignal, JUDGE_DEFAULTS.stackSignal),
+    extremeKeyword: numeric(given.extremeKeyword, JUDGE_DEFAULTS.extremeKeyword),
+    hardKeyword: numeric(given.hardKeyword, JUDGE_DEFAULTS.hardKeyword),
+    mediumKeyword: numeric(given.mediumKeyword, JUDGE_DEFAULTS.mediumKeyword),
+    question2: numeric(given.question2, JUDGE_DEFAULTS.question2),
+    question4: numeric(given.question4, JUDGE_DEFAULTS.question4),
+    numbered3: numeric(given.numbered3, JUDGE_DEFAULTS.numbered3),
+    numbered5: numeric(given.numbered5, JUDGE_DEFAULTS.numbered5),
+    files2: numeric(given.files2, JUDGE_DEFAULTS.files2),
+    files4: numeric(given.files4, JUDGE_DEFAULTS.files4),
+    regenerate: numeric(given.regenerate, JUDGE_DEFAULTS.regenerate),
+    correction: numeric(given.correction, JUDGE_DEFAULTS.correction),
+    shortCap: numeric(given.shortCap, JUDGE_DEFAULTS.shortCap),
+    forceHigh: numeric(given.forceHigh, JUDGE_DEFAULTS.forceHigh),
+    hardRetry: numeric(given.hardRetry, JUDGE_DEFAULTS.hardRetry),
+    extremeKeywords: [...JUDGE_DEFAULTS.extremeKeywords, ...words(given.extremeKeywords), ...words(given.broadKeywords)],
+    hardKeywords: [...JUDGE_DEFAULTS.hardKeywords, ...words(given.hardKeywords)],
+    mediumKeywords: [...JUDGE_DEFAULTS.mediumKeywords, ...words(given.mediumKeywords)],
   }
 }
 
 const extraCache = new Map()
 
 /** Extra keywords are matched as plain text, so a stray `(` in config cannot break the regex. */
-function extraRegex(words) {
-  if (words.length === 0) return null
-  const key = words.join('\u0000')
+function extraRegex(wordsList) {
+  if (wordsList.length === 0) return null
+  const key = wordsList.join('\u0000')
   const hit = extraCache.get(key)
   if (hit !== undefined) return hit
-  const escaped = words.map((word) => word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+  const escaped = wordsList.map((word) => word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
   const built = new RegExp(escaped.join('|'), 'i')
   extraCache.set(key, built)
   return built
+}
+
+/**
+ * Count distinct words in one category. English words need word boundaries; Chinese words are
+ * matched as plain substrings because JavaScript's \b does not treat CJK as word characters.
+ */
+function keywordHits(text, wordsList) {
+  let hits = 0
+  for (const word of wordsList) {
+    if (typeof word !== 'string' || word === '') continue
+    if (/^[A-Za-z]/.test(word)) {
+      const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const re = new RegExp(`(^|[^A-Za-z0-9_])${escaped}(?:s|es|ed|d|ing)?(?=$|[^A-Za-z0-9_])`, 'i')
+      if (re.test(text)) hits += 1
+    } else if (text.includes(word)) {
+      hits += 1
+    }
+  }
+  return hits
 }
 
 const GREETING_RE = /^(?:hi|hello|hey|你好|您好|嗨|在吗|谢谢|多谢|thanks|thank you|ok|okay|好的|好|嗯|收到)[\s!！。.?？~～]*$/i
@@ -150,108 +254,219 @@ const FORCE_HIGH_RE = /(?:仔细(?:想|思考|分析|检查)|认真(?:想|思考
 const FORCE_MAX_RE = /(?:最高(?:强度|档)|最强|全力|彻底|穷尽|非常复杂|极其复杂|maximum effort|as hard as possible)/i
 
 const CODE_FENCE_RE = /```|~~~/
-const ERROR_RE = /\b(?:error|exception|traceback|segfault|stack trace|failed|failure)\b|报错|错误|异常|崩溃|闪退|堆栈/i
-const HARD_RE = /(?:重构|架构|迁移|性能优化|并发|死锁|内存泄漏|安全|漏洞|算法|复杂度|编译|部署|调试|排查|修复|测试|单元测试|覆盖率|流水线|插件|协议|逆向|源码|解析)|(?:refactor|architect\w*|migrat\w*|optimi[sz]\w*|\bperformance\b|concurren\w*|\bdeadlock\w*|race condition|memory leak|\bsecurity\b|vulnerab\w*|\balgorithm\w*|\bdebug\w*|diagnos\w*|\bfix(?:es|ed|ing)?\b|test suite|\bcoverage\b|\bpipeline\w*|reverse[- ]engineer)/i
-const MAX_RE = /(?:整个项目|代码库|多个文件|全量|端到端|设计文档|技术方案|调研报告|对比分析|评审|论文|白皮书)|(?:entire (?:codebase|project)|whole repo|multiple files|end[- ]to[- ]end|design doc\w*|architecture review|proof|theorem|from scratch|comprehensive|systematic)/i
+const ERROR_WORD_RE = /\b(?:error|errors|exception|exceptions|failed|failure|crash|crashes)\b|报错|错误|异常|崩溃|闪退|失败|不工作/i
+const STACK_RE = /(?:Traceback \(most recent call last\)|Caused by:|npm ERR!|^\s*at\s+.+\(.+:\d+(?::\d+)?\)|^\s*File ".*", line \d+|^\s*(?:TypeError|ReferenceError|SyntaxError|RangeError|LlmError|Error):)/m
 const FILE_RE = /\b[\w./-]+\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|cs|cpp|cc|c|h|hpp|json|ya?ml|toml|sql|sh|ps1|html|css)\b/gi
 
+function codeScore(raw, opt) {
+  const blocks = []
+  const re = /```[\s\S]*?```|~~~[\s\S]*?~~~/g
+  let match
+  while ((match = re.exec(raw)) !== null) blocks.push(match[0])
+  if (blocks.length === 0) return 0
+  const lines = blocks.reduce((total, block) => total + block.split('\n').length, 0)
+  if (blocks.length >= 2 || lines > 60) return opt.codeLarge
+  if (lines >= 20) return opt.codeMedium
+  return opt.codeSmall
+}
+
+function previousScore(value) {
+  if (Number.isFinite(value)) return clampScore(value)
+  if (TIERS.includes(value)) return scoreForTier(value)
+  return undefined
+}
+
 /**
- * Deterministic tier judgment. Exported so it can be exercised without a running harness.
- * `prevTier`/`prevTask` are the previous turn's served tier and its task text; `options` carries
- * the profile's thresholds and extra keywords (see `judgeOptions`).
+ * Pure 0–100 local scorer. Exported for tests and for anyone who wants to reuse the same
+ * deterministic judgement outside the plugin. `prevScore` is the previous turn's score (or a
+ * legacy tier string); `prevTask` is its clipped task text.
  */
-export function judgeTaskLocal(text, prevTier, prevTask, options) {
+export function scoreTask(text, prevScore, prevTask, options) {
   const merged = judgeOptions(options)
-  const opt = { ...merged, hard: extraRegex(merged.hardKeywords), broad: extraRegex(merged.broadKeywords) }
+  const opt = merged
   const raw = String(text === undefined || text === null ? '' : text).trim()
+  const prev = previousScore(prevScore)
   if (raw === '') {
-    return { tier: prevTier === undefined ? 'low' : tierOf(prevTier), triggered_by: 'empty', labels: [] }
+    return { score: prev === undefined ? 0 : prev, triggered_by: 'empty', labels: [] }
   }
   const flat = normalize(raw)
   const labels = []
 
   // A regenerate resends the same prompt: that is the strongest escalation signal we get.
   if (prevTask !== undefined && prevTask !== null && normalize(prevTask) === flat) {
-    return { tier: bump(tierOf(prevTier)), triggered_by: 'regenerate', labels: ['same-task'] }
+    return {
+      score: clampScore((prev === undefined ? 40 : prev) + opt.regenerate),
+      triggered_by: 'regenerate',
+      labels: ['same-task'],
+    }
   }
   if (HARD_RETRY_RE.test(flat)) {
-    return { tier: 'max', triggered_by: 'hard-retry', labels: ['hard-retry'] }
+    return { score: opt.hardRetry, triggered_by: 'hard-retry', labels: ['hard-retry'] }
   }
-  if (prevTier !== undefined && CORRECTION_RE.test(flat)) {
-    return { tier: bump(tierOf(prevTier)), triggered_by: 'correction', labels: ['correction'] }
+  if (prev !== undefined && CORRECTION_RE.test(flat)) {
+    return { score: clampScore(prev + opt.correction), triggered_by: 'correction', labels: ['correction'] }
   }
   if (GREETING_RE.test(flat)) {
-    return { tier: 'low', triggered_by: 'short', labels: ['greeting'] }
+    return { score: 0, triggered_by: 'short', labels: ['greeting'] }
   }
-  if (CONTINUE_RE.test(flat) && prevTier !== undefined) {
-    return { tier: tierOf(prevTier), triggered_by: 'intent_inherit', labels: ['continue'] }
+  if (CONTINUE_RE.test(flat) && prev !== undefined) {
+    return { score: prev, triggered_by: 'intent_inherit', labels: ['continue'] }
   }
-  // "简短 / 一句话" asks for a shorter answer; it is not proof that the task is easy, so it
-  // caps the tier instead of short-circuiting the content signals below.
-  const wantsShort = FORCE_LOW_RE.test(flat)
 
+  // Length is a weak signal on its own: a long pasted log usually contains the real question at
+  // the end, but a long greeting or a long URL should not dominate the other signals.
   let score = 0
-  const len = flat.length
-  const [l1, l2, l3] = opt.lengthTiers
-  if (len >= l1) { score += 1; labels.push('long') }
-  if (len >= l2) { score += 1; labels.push('very-long') }
-  if (len >= l3) { score += 2; labels.push('huge') }
-  if (CODE_FENCE_RE.test(raw)) { score += 2; labels.push('code') }
-  if (ERROR_RE.test(raw)) { score += 1; labels.push('error') }
-  if (HARD_RE.test(raw) || (opt.hard !== null && opt.hard.test(raw))) { score += 2; labels.push('hard-topic') }
-  if (MAX_RE.test(raw) || (opt.broad !== null && opt.broad.test(raw))) { score += 3; labels.push('broad-scope') }
-
-  const questions = (raw.match(/[?？]/g) || []).length
-  if (questions >= 2) { score += 1; labels.push('multi-question') }
-  if (questions >= 4) { score += 1; labels.push('many-questions') }
-
-  const files = (raw.match(FILE_RE) || []).length
-  if (files >= 2) { score += 1; labels.push('multi-file') }
-  if (files >= 5) { score += 1; labels.push('many-files') }
-
-  const numbered = (raw.match(/^\s*(?:\d+[.、)]|[-*])\s+/gm) || []).length
-  if (numbered >= 4) { score += 1; labels.push('checklist') }
-
-  let tier = score >= opt.scoreMax ? 'max' : score >= opt.scoreHigh ? 'high' : 'low'
-  let triggeredBy = 'content'
-
-  if (wantsShort) {
-    if (score < 2) {
-      tier = 'low'
-      triggeredBy = 'intent_exclude'
-      labels.push('explicit-short')
-    } else if (tier === 'max') {
-      tier = 'high'
-      labels.push('explicit-short')
+  const len = raw.length
+  for (let i = 0; i < opt.lengthCuts.length - 1; i += 1) {
+    if (len >= opt.lengthCuts[i]) {
+      score = opt.lengthScores[i + 1]
+      labels.push(i === 0 ? 'long' : i === 1 ? 'very-long' : i === 2 ? 'huge' : 'massive')
     }
   }
 
-  if (FORCE_MAX_RE.test(flat)) {
-    tier = 'max'
-    triggeredBy = 'intent_force'
-    labels.push('explicit-max')
-  } else if (FORCE_HIGH_RE.test(flat)) {
-    if (tier === 'low') tier = 'high'
-    triggeredBy = 'intent_force'
-    labels.push('explicit-high')
+  const code = codeScore(raw, opt)
+  if (code > 0) {
+    score += code
+    labels.push('code')
   }
 
-  return { tier, triggered_by: triggeredBy, labels }
+  let error = 0
+  if (ERROR_WORD_RE.test(raw)) {
+    error += opt.errorWord
+    labels.push('error')
+  }
+  if (STACK_RE.test(raw)) {
+    error += opt.stackSignal
+    labels.push('stack')
+  }
+  score += Math.min(15, error)
+
+  let keywords = 0
+  const extreme = keywordHits(raw, merged.extremeKeywords)
+  const hard = keywordHits(raw, merged.hardKeywords)
+  const medium = keywordHits(raw, merged.mediumKeywords)
+  keywords += Math.min(35, extreme * opt.extremeKeyword + hard * opt.hardKeyword + medium * opt.mediumKeyword)
+  if (extreme > 0) labels.push('broad-scope')
+  if (hard > 0) labels.push('hard-topic')
+  if (medium > 0) labels.push('topic')
+  score += keywords
+
+  let structure = 0
+  const questions = (raw.match(/[?？]/g) || []).length
+  if (questions >= 4) {
+    structure += opt.question4
+    labels.push('many-questions')
+  } else if (questions >= 2) {
+    structure += opt.question2
+    labels.push('multi-question')
+  }
+
+  const numbered = (raw.match(/^\s*(?:\d+[.、)]|[-*])\s+/gm) || []).length
+  if (numbered >= 5) {
+    structure += opt.numbered5
+    labels.push('checklist')
+  } else if (numbered >= 3) {
+    structure += opt.numbered3
+    labels.push('checklist')
+  }
+
+  const files = (raw.match(FILE_RE) || []).length
+  if (files >= 4) {
+    structure += opt.files4
+    labels.push('multi-file')
+  } else if (files >= 2) {
+    structure += opt.files2
+    labels.push('multi-file')
+  }
+  score += Math.min(10, structure)
+
+  if (prev === undefined && CORRECTION_RE.test(flat)) {
+    score += opt.correction
+    labels.push('correction')
+  }
+  if (FORCE_LOW_RE.test(flat)) {
+    if (score > opt.shortCap) {
+      score = opt.shortCap
+      labels.push('explicit-short')
+    }
+  }
+  if (FORCE_MAX_RE.test(flat)) {
+    score = 100
+    labels.push('explicit-max')
+    return { score, triggered_by: 'intent_force', labels }
+  }
+  if (FORCE_HIGH_RE.test(flat)) {
+    score = Math.max(score, opt.forceHigh)
+    labels.push('explicit-high')
+    return { score: clampScore(score), triggered_by: 'intent_force', labels }
+  }
+
+  return {
+    score: clampScore(score),
+    triggered_by: FORCE_LOW_RE.test(flat) && score <= opt.shortCap ? 'intent_exclude' : 'content',
+    labels,
+  }
 }
 
-/** First declared effort matching the tier's preference order, then nearest by rank. */
+/**
+ * Tier-compatible wrapper kept for older callers. New code should use `scoreTask` so the
+ * original 0–100 signal is not collapsed to three buckets.
+ */
+export function judgeTaskLocal(text, prevTier, prevTask, options) {
+  const verdict = scoreTask(text, prevTier, prevTask, options)
+  return { ...verdict, tier: tierForScore(verdict.score) }
+}
+
+/** Build the ordered effort ladder a model actually advertises. `off` is not a strength. */
+export function buildEffortLadder(efforts, options) {
+  const includeOff = options !== undefined && options !== null && options.includeOff === true
+  const list = []
+  const seen = new Set()
+  for (const item of Array.isArray(efforts) ? efforts : []) {
+    const id = typeof item === 'string' ? item : item !== null && typeof item === 'object' ? item.id : undefined
+    if (typeof id !== 'string' || id === '' || seen.has(id)) continue
+    seen.add(id)
+    list.push({ id, name: typeof item === 'object' && item !== null && typeof item.name === 'string' ? item.name : id })
+  }
+  const usable = list.filter((entry) => includeOff || entry.id !== 'off')
+  if (usable.length === 0) return []
+  // The adapter advertises efforts weakest → strongest, which is also pi-ai's order. If every id
+  // is one of the standard levels, sort explicitly so a hand-written custom adapter cannot
+  // accidentally reverse the ladder.
+  if (usable.every((entry) => EFFORT_RANK[entry.id] !== undefined)) {
+    usable.sort((a, b) => EFFORT_RANK[a.id] - EFFORT_RANK[b.id])
+  }
+  return usable
+}
+
+/**
+ * Pick a rung from the model's own ladder. Examples: 2 levels split 0–49/50–100, 3 levels
+ * 0–33/34–66/67–100, 4 levels 0–24/25–49/50–74/75–100.
+ */
+export function chooseEffortForScore(score, efforts, options) {
+  const ladder = buildEffortLadder(efforts, options)
+  if (ladder.length === 0) return null
+  const s = clampScore(score)
+  const index = Math.min(ladder.length - 1, Math.floor((s / 100) * ladder.length))
+  return { effort: ladder[index].id, index, count: ladder.length, ladder: ladder.map((entry) => entry.id) }
+}
+
+/** Legacy tier-based selector. Kept for compatibility; not used by the request path. */
 export function chooseEffort(tier, efforts, overrides) {
-  if (!Array.isArray(efforts) || efforts.length === 0) return null
+  const ids = Array.isArray(efforts)
+    ? efforts.map((item) => (typeof item === 'string' ? item : item !== null && typeof item === 'object' ? item.id : undefined)).filter((id) => typeof id === 'string')
+    : []
+  if (ids.length === 0) return null
   const order = overrides !== undefined && overrides !== null && Array.isArray(overrides[tier])
     ? overrides[tier]
     : TIER_EFFORT_ORDER[tier]
   for (const id of order || []) {
-    if (efforts.includes(id)) return id
+    if (ids.includes(id)) return id
   }
   const target = TIER_RANK[tier]
   let best = null
   let bestDistance = Infinity
-  for (const id of efforts) {
+  for (const id of ids) {
     if (EFFORT_RANK[id] === undefined) continue
     const distance = Math.abs(EFFORT_RANK[id] - target)
     if (distance < bestDistance || (distance === bestDistance && EFFORT_RANK[id] > EFFORT_RANK[best])) {
@@ -260,21 +475,13 @@ export function chooseEffort(tier, efforts, overrides) {
     }
   }
   if (best !== null) return best
-  // The host calls effort ids adapter-owned opaque strings, so a model may advertise a vocabulary
-  // this plugin cannot rank (none/thinking/deep). The advertised array is ordered weakest to
-  // strongest, so fall back to its ends instead of silently doing nothing for that model.
-  const last = efforts.length - 1
-  if (tier === 'low') return efforts[0]
-  if (tier === 'max') return efforts[last]
-  return efforts[Math.floor(last / 2)]
+  const last = ids.length - 1
+  if (tier === 'low') return ids[0]
+  if (tier === 'max') return ids[last]
+  return ids[Math.floor(last / 2)]
 }
 
-/**
- * How far the served effort sits from the tier's own level. A model whose declared set is
- * narrower than the tier vocabulary cannot express every tier, so the served effort is reported
- * as `raised` (its lowest level is already above the tier) or `capped` (its highest is still
- * below it) instead of silently pretending the tier was met.
- */
+/** Legacy tier-vs-effort probe, retained for older callers. */
 export function effortMapping(tier, effort) {
   const want = TIER_RANK[tier]
   const got = EFFORT_RANK[effort]
@@ -283,8 +490,8 @@ export function effortMapping(tier, effort) {
   return got > want ? 'raised' : 'capped'
 }
 
-/** POST the original Laya v2 wire format; any failure returns null so the local judge takes over. */
-export async function judgeTaskRemote(url, text, prevTier, prevTask, sessionId, signal, timeoutMs) {
+/** POST the original Laya v2 wire format; any failure returns null so the local scorer wins. */
+export async function judgeTaskRemote(url, text, prevScore, prevTask, sessionId, signal, timeoutMs) {
   if (typeof url !== 'string' || url === '') return null
   const budget = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : REMOTE_JUDGE_TIMEOUT_MS
   const controller = new AbortController()
@@ -300,7 +507,12 @@ export async function judgeTaskRemote(url, text, prevTier, prevTask, sessionId, 
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         task: clipTask(text),
-        prev_tier: prevTier === undefined ? null : prevTier,
+        prev_score: prevScore === undefined ? null : prevScore,
+        prev_tier: typeof prevScore === 'string'
+          ? prevScore
+          : Number.isFinite(Number(prevScore))
+            ? (Number(prevScore) >= 67 ? 'max' : Number(prevScore) >= 34 ? 'high' : 'low')
+            : null,
         prev_task: prevTask === undefined ? null : prevTask,
         session_id: sessionId === undefined ? null : sessionId,
       }),
@@ -311,12 +523,19 @@ export async function judgeTaskRemote(url, text, prevTier, prevTask, sessionId, 
       return null
     }
     const body = await res.json()
+    if (Number.isFinite(Number(body.score))) {
+      return {
+        score: clampScore(Number(body.score)),
+        triggered_by: body.triggered_by || 'remote',
+        labels: Array.isArray(body.labels) ? body.labels : null,
+      }
+    }
     const tier = body.tier ?? body.level
     if (!TIERS.includes(tier)) {
-      log(`judge ${url} returned no usable tier`, 'warn')
+      log(`judge ${url} returned no usable score`, 'warn')
       return null
     }
-    return { tier, triggered_by: body.triggered_by || 'remote', labels: body.labels || null }
+    return { score: scoreForTier(tier), triggered_by: body.triggered_by || 'remote', labels: body.labels || null }
   } catch (error) {
     log(`judge ${url} failed: ${error.message}`, 'warn')
     return null
@@ -363,6 +582,13 @@ function textOf(message) {
   }
   if (typeof message.text === 'string') return message.text
   return ''
+}
+
+/** Tool results and runtime context travel through the same inbox. Only the human's own message may score. */
+function isUserMessage(message) {
+  if (message === undefined || message === null || message.role !== 'user') return false
+  const kind = message.source !== undefined && message.source !== null ? message.source.kind : undefined
+  return kind === undefined || kind === 'user'
 }
 
 function json(res, code, body) {
@@ -416,23 +642,35 @@ function keyOf(payload) {
   return 'global'
 }
 
-/**
- * One wire row. The model's declared effort set is deliberately not repeated here: it is constant
- * per provider/model, so `/state` carries it once in `models` instead of once per row.
- */
-function rowFor(tier, effort, judgment, task, provider, model, note, mapping) {
+/** One history row. The model's effort vocabulary is constant per model, so `/state` carries it once. */
+function rowFor(judgment, selection, task, provider, model, note) {
+  const score = judgment !== null && judgment !== undefined && Number.isFinite(judgment.score) ? scoreTaskGuard(judgment.score) : null
   return {
     ts: Math.round(Date.now() / 1000),
-    tier,
-    effort,
+    score,
+    tier: score === null ? null : tierForScore(score),
+    effort: selection !== null && selection !== undefined ? selection.effort : null,
+    levelIndex: selection !== null && selection !== undefined ? selection.index : null,
+    levelCount: selection !== null && selection !== undefined ? selection.count : null,
+    ladder: selection !== null && selection !== undefined ? selection.ladder : null,
     provider,
     model,
-    task: task === undefined ? '' : task.text.slice(0, 120),
-    triggered_by: judgment === null ? 'no-task' : judgment.triggered_by,
-    labels: judgment === null ? null : judgment.labels,
-    note,
-    mapping: mapping === undefined ? null : mapping,
+    task: task === undefined || task === null ? '' : clipTask(String(task), 120),
+    triggered_by: judgment === null || judgment === undefined ? 'no-task' : judgment.triggered_by,
+    labels: judgment === null || judgment === undefined ? null : judgment.labels,
+    note: note === undefined ? '' : note,
   }
+}
+
+function scoreTaskGuard(value) {
+  return Math.max(0, Math.min(100, Math.round(Number(value))))
+}
+
+/** Find the index of an effort that is already in a model's ladder (used for deferred rows). */
+function selectionForEffort(effort, capability) {
+  const ladder = capability !== undefined && capability !== null && Array.isArray(capability.ladder) ? capability.ladder : []
+  const index = ladder.indexOf(effort)
+  return { effort, index: index >= 0 ? index : null, count: ladder.length || null, ladder: ladder.length ? ladder : null }
 }
 
 export function apply(ctx, config) {
@@ -442,16 +680,19 @@ export function apply(ctx, config) {
   const useGlobal = cfg.global !== false
   const judgeConfig = judgeOptions(cfg.judge)
   const modelCache = new Map()
-  const tasks = new Map()
-  const verdicts = new Map()
+  const warming = new Map()
   const sessionState = new Map()
   const lastApplied = new Map()
+  const claimState = new Map()
   const history = new Map()
+  const remoteScores = new Map()
+  const remotePending = new Set()
   const judgeTimeout = Number.isFinite(cfg.judgeTimeoutMs)
     ? Math.min(Math.max(Math.round(cfg.judgeTimeoutMs), 100), 10000)
     : REMOTE_JUDGE_TIMEOUT_MS
   let judgeFailures = 0
   let judgeSkipUntil = 0
+  let warmTimer = null
 
   const state = { mode: mountMode, updatedAt: Date.now(), sessions: {}, last: null }
 
@@ -468,7 +709,6 @@ export function apply(ctx, config) {
     const rows = history.get(key) || []
     rows.push(row)
     while (rows.length > HISTORY_LIMIT) rows.shift()
-    // Re-insert on every write so Map order is recency order, not creation order.
     history.delete(key)
     history.set(key, rows)
     state.sessions[key] = rows
@@ -478,182 +718,230 @@ export function apply(ctx, config) {
       const oldest = history.keys().next().value
       history.delete(oldest)
       delete state.sessions[oldest]
-      tasks.delete(oldest)
-      verdicts.delete(oldest)
       sessionState.delete(oldest)
       lastApplied.delete(oldest)
+      claimState.delete(oldest)
     }
   }
 
-  async function effortsFor(llm, provider, model, signal) {
-    const cacheKey = `${provider}\u0000${model}`
-    const hit = modelCache.get(cacheKey)
-    if (hit !== undefined && Date.now() - hit.at < MODEL_INFO_TTL_MS) return hit
-    const info = await llm.resolveModelInfo(provider, model, signal)
+  function capabilityOf(info) {
     const declared = info !== undefined && info !== null && info.reasoning !== undefined && info.reasoning !== null
       ? info.reasoning
       : null
-    const capability = {
+    const ladder = declared !== null ? buildEffortLadder(declared.efforts, { includeOff: cfg.includeOff === true }) : []
+    return {
       at: Date.now(),
-      supported: declared !== null && Array.isArray(declared.efforts)
-        ? declared.efforts.map((effort) => effort.id).filter((id) => typeof id === 'string')
-        : [],
+      supported: ladder.map((entry) => entry.id),
+      ladder: ladder.map((entry) => entry.id),
       defaultEffort: declared === null ? undefined : declared.defaultEffort,
+      error: null,
     }
-    modelCache.set(cacheKey, capability)
-    return capability
   }
 
-  /**
-   * Remote judgment sits on the critical path of the turn, so a dead endpoint must not cost the
-   * full budget on every request: after a few consecutive failures the judge is skipped for a
-   * cooldown and the local scorer takes over.
-   */
-  async function judgeRemote(task, previous, payload) {
-    if (typeof cfg.judgeUrl !== 'string' || cfg.judgeUrl === '') return null
-    if (Date.now() < judgeSkipUntil) return null
-    const verdict = await judgeTaskRemote(
-      cfg.judgeUrl,
-      task.text,
-      previous === undefined ? undefined : previous.tier,
-      previous === undefined ? undefined : previous.task,
-      task.sessionId,
-      payload !== undefined && payload !== null ? payload.signal : undefined,
-      judgeTimeout,
-    )
-    if (verdict === null) {
-      judgeFailures += 1
-      if (judgeFailures >= JUDGE_BREAKER_FAILURES) {
-        judgeFailures = 0
-        judgeSkipUntil = Date.now() + JUDGE_BREAKER_COOLDOWN_MS
-        log(`remote judge unreachable; skipping it for ${Math.round(JUDGE_BREAKER_COOLDOWN_MS / 1000)}s`, 'warn')
+  function cacheKeyOf(provider, model) {
+    return `${provider}\u0000${model}`
+  }
+
+  async function warmModel(provider, model, signal) {
+    const llm = typeof ctx.get === 'function' ? ctx.get('llm') : undefined
+    if (llm === undefined || llm === null || typeof llm.resolveModelInfo !== 'function') return null
+    const cacheKey = cacheKeyOf(provider, model)
+    const pending = warming.get(cacheKey)
+    if (pending !== undefined) return pending
+    const promise = (async () => {
+      try {
+        const info = await llm.resolveModelInfo(provider, model, signal)
+        const capability = capabilityOf(info)
+        modelCache.set(cacheKey, capability)
+        return capability
+      } catch (error) {
+        log(`model info failed for ${provider}/${model}: ${error.message}`, 'warn')
+        modelCache.set(cacheKey, { at: Date.now(), supported: [], ladder: [], defaultEffort: undefined, error: error.message })
+        return null
+      } finally {
+        warming.delete(cacheKey)
       }
-    } else {
-      judgeFailures = 0
-    }
-    return verdict
+    })()
+    warming.set(cacheKey, promise)
+    return promise
   }
 
-  ctx.on('agent/inbox/claimed', (payload) => {
-    const message = payload !== undefined && payload !== null ? payload.message : undefined
-    // Tool results and injected context travel through the same inbox. Letting their text decide
-    // the tier would mean a long file dump or a stack trace picks the effort, so only the user's
-    // own message counts.
-    if (message !== undefined && message !== null && typeof message.role === 'string' && message.role !== 'user') return
-    const key = keyOf(payload)
+  function capabilityFor(provider, model) {
+    const cacheKey = cacheKeyOf(provider, model)
+    const hit = modelCache.get(cacheKey)
+    if (hit === undefined) return null
+    if (Date.now() - hit.at >= MODEL_INFO_TTL_MS) warmModel(provider, model).catch(() => {})
+    return hit
+  }
+
+  async function warmAll() {
+    const llm = typeof ctx.get === 'function' ? ctx.get('llm') : undefined
+    if (llm === undefined || llm === null || typeof llm.listProviders !== 'function') return
+    let providers = []
+    try {
+      providers = llm.listProviders()
+    } catch (error) {
+      log(`could not list providers: ${error.message}`, 'warn')
+      return
+    }
+    for (const provider of Array.isArray(providers) ? providers : []) {
+      const providerId = provider !== null && typeof provider === 'object' ? provider.id : undefined
+      if (typeof providerId !== 'string' || providerId === '') continue
+      let models = []
+      try {
+        models = await llm.listModels(providerId)
+      } catch (error) {
+        log(`could not list models for ${providerId}: ${error.message}`, 'warn')
+        continue
+      }
+      for (const model of Array.isArray(models) ? models : []) {
+        const modelId = typeof model === 'string' ? model : model !== null && typeof model === 'object' ? model.id : undefined
+        if (typeof modelId === 'string' && modelId !== '') await warmModel(providerId, modelId).catch(() => {})
+      }
+    }
+  }
+
+  function scheduleWarmAll() {
+    if (warmTimer !== null) return
+    warmTimer = setTimeout(() => {
+      warmTimer = null
+      warmAll().catch((error) => log(`warm-up failed: ${error.message}`, 'warn'))
+    }, 250)
+    if (typeof warmTimer.unref === 'function') warmTimer.unref()
+  }
+
+  function remoteScoreFor(message, key) {
+    if (message === undefined || message === null || typeof message.id !== 'string' || message.id === '') return undefined
+    const hit = remoteScores.get(message.id)
+    if (hit !== undefined) {
+      remoteScores.delete(message.id)
+      return hit
+    }
+    return undefined
+  }
+
+  function judgeRemoteInBackground(message, payload) {
+    if (typeof cfg.judgeUrl !== 'string' || cfg.judgeUrl === '') return
+    if (Date.now() < judgeSkipUntil) return
+    if (message === undefined || message === null || typeof message.id !== 'string' || message.id === '') return
+    if (remoteScores.has(message.id) || remotePending.has(message.id)) return
     const text = textOf(message)
     if (normalize(text) === '') return
-    const previous = tasks.get(key)
-    if (previous !== undefined && message !== undefined && message !== null
-      && typeof message.id === 'string' && previous.messageId === message.id) return
+    const key = keyOf(payload)
+    const previous = sessionState.get(key)
     const session = payload !== undefined && payload !== null && payload.agent !== undefined ? payload.agent.session : undefined
-    tasks.set(key, {
-      text: clipTask(text, judgeConfig.judgeMaxChars),
-      messageId: message !== undefined && message !== null ? message.id : undefined,
-      sessionId: session !== undefined && session !== null ? session.id : undefined,
-    })
+    const sessionId = session !== undefined && session !== null ? session.id : undefined
+    remotePending.add(message.id)
+    judgeTaskRemote(cfg.judgeUrl, text, previous === undefined ? undefined : previous.score, previous === undefined ? undefined : previous.task, sessionId, undefined, judgeTimeout)
+      .then((verdict) => {
+        if (verdict !== null) {
+          remoteScores.set(message.id, verdict)
+          while (remoteScores.size > 100) {
+            const oldest = remoteScores.keys().next().value
+            remoteScores.delete(oldest)
+          }
+        } else {
+          judgeFailures += 1
+          if (judgeFailures >= JUDGE_BREAKER_FAILURES) {
+            judgeFailures = 0
+            judgeSkipUntil = Date.now() + JUDGE_BREAKER_COOLDOWN_MS
+            log(`remote judge unreachable; skipping it for ${Math.round(JUDGE_BREAKER_COOLDOWN_MS / 1000)}s`, 'warn')
+          }
+        }
+      })
+      .catch((error) => log(`remote judge failed: ${error.message}`, 'warn'))
+      .finally(() => remotePending.delete(message.id))
+  }
+
+  ctx.on('llm/adapters-updated', () => scheduleWarmAll())
+
+  ctx.on('agent/inbox/inserted', (payload) => {
+    const message = payload !== undefined && payload !== null ? payload.message : undefined
+    if (!isUserMessage(message)) return
+    judgeRemoteInBackground(message, payload)
   }, { global: useGlobal })
 
-  ctx.on('agent/request', async (payload, next) => {
-    const requestConfig = await next()
-    if (mode.value === 'manual') return requestConfig
-
-    const key = keyOf(payload)
-    const turn = payload !== undefined && payload !== null ? payload.turn : undefined
-    const cached = verdicts.get(key)
-    if (cached !== undefined && cached.turn === turn) {
-      return cached.effort === null ? requestConfig : { ...requestConfig, reasoningEffort: cached.effort }
-    }
-
-    const task = tasks.get(key)
-    const prev = sessionState.get(key)
-    const stateEntry = prev !== undefined && turn !== undefined && prev.turn !== undefined && turn < prev.turn
-      ? undefined
-      : prev
-
-    let judgment = null
-    if (task !== undefined) {
-      judgment = await judgeRemote(task, stateEntry, payload)
-      if (judgment === null) {
-        judgment = judgeTaskLocal(
-          task.text,
-          stateEntry === undefined ? undefined : stateEntry.tier,
-          stateEntry === undefined ? undefined : stateEntry.task,
-          judgeConfig,
-        )
-      }
-    }
-    // A step without new user text (tool loop, auto-continuation) keeps the tier of the turn it
-    // belongs to instead of dropping to low halfway through a hard task.
-    const tier = judgment !== null
-      ? tierOf(judgment.tier)
-      : stateEntry !== undefined ? tierOf(stateEntry.tier) : 'low'
-
-    const provider = requestConfig !== undefined && requestConfig !== null ? requestConfig.provider : undefined
-    const model = requestConfig !== undefined && requestConfig !== null ? requestConfig.model : undefined
-    if (typeof provider !== 'string' || typeof model !== 'string') {
-      verdicts.set(key, { turn, effort: null })
-      return requestConfig
-    }
-
-    const llm = ctx.get('llm')
-    if (llm === undefined || llm === null || typeof llm.resolveModelInfo !== 'function') {
-      verdicts.set(key, { turn, effort: null })
-      log('llm service unavailable; leaving the request untouched', 'warn')
-      return requestConfig
-    }
-
-    let capability
+  ctx.on('agent/inbox/claimed', (payload) => {
     try {
-      capability = await effortsFor(llm, provider, model, payload !== undefined && payload !== null ? payload.signal : undefined)
-    } catch (error) {
-      log(`model info failed for ${provider}/${model}: ${error.message}`, 'warn')
-      verdicts.set(key, { turn, effort: null })
-      return requestConfig
-    }
+      const message = payload !== undefined && payload !== null ? payload.message : undefined
+      if (!isUserMessage(message)) return
+      if (mode.value === 'manual') return
+      const text = textOf(message)
+      if (normalize(text) === '') return
+      const agent = payload !== undefined && payload !== null ? payload.agent : undefined
+      const model = agent !== undefined && agent !== null ? agent.model : undefined
+      if (model === undefined || model === null || typeof model.current !== 'function' || typeof model.select !== 'function') return
+      const current = model.current()
+      if (current === undefined || current === null || typeof current.provider !== 'string' || typeof current.model !== 'string') return
 
-    const supported = capability.supported
-    const effort = chooseEffort(tier, supported, cfg.efforts)
-    let note = ''
-
-    if (effort === null) {
-      note = supported.length === 0 ? 'unsupported' : 'no-matching-effort'
-      verdicts.set(key, { turn, effort: null })
-      record(key, rowFor(tier, null, judgment, task, provider, model, note))
-      log(`turn ${turn} ${tier} -> ${note} (${provider}/${model})`, 'warn')
-      return requestConfig
-    }
-
-    // A foreign explicit effort (subagent pin, session override) is respected when asked to.
-    if (cfg.respectExplicit === true && requestConfig.reasoningEffort !== undefined) {
-      const previous = lastApplied.get(key)
-      const ours = previous !== undefined
-        && previous.effort === requestConfig.reasoningEffort
-        && previous.provider === provider
-        && previous.model === model
-      if (!ours) {
-        note = 'explicit'
-        verdicts.set(key, { turn, effort: null })
-        record(key, rowFor(tier, requestConfig.reasoningEffort, judgment, task, provider, model, note))
-        log(`turn ${turn} ${tier} -> deferring to explicit ${requestConfig.reasoningEffort}`)
-        return requestConfig
+      const key = keyOf(payload)
+      const turn = payload !== undefined && payload !== null ? payload.turn : undefined
+      let claim = claimState.get(key)
+      if (claim === undefined || claim.turn !== turn) {
+        const previous = sessionState.get(key)
+        claim = {
+          turn,
+          previousScore: previous === undefined ? undefined : previous.score,
+          previousTask: previous === undefined ? undefined : previous.task,
+          bestScore: null,
+        }
+        claimState.set(key, claim)
       }
-    }
 
-    const mapping = effortMapping(tier, effort)
-    lastApplied.set(key, { effort, provider, model, tier })
-    verdicts.set(key, { turn, effort })
-    if (task !== undefined) {
-      sessionState.set(key, { tier, task: task.text, turn })
-      tasks.delete(key)
-    }
-    record(key, rowFor(tier, effort, judgment, task, provider, model, '', mapping))
+      const remote = remoteScoreFor(message)
+      const judgment = remote !== undefined ? remote : scoreTask(text, claim.previousScore, claim.previousTask, judgeConfig)
+      if (claim.bestScore !== null && judgment.score <= claim.bestScore) return
 
-    const changed = requestConfig.reasoningEffort !== effort
-    log(`turn ${turn} ${tier} (${judgment === null ? 'no-task' : judgment.triggered_by})`
-      + ` -> ${effort}${mapping === 'exact' ? '' : ` (${mapping})`}${changed ? '' : ' (already)'}`
-      + ` on ${provider}/${model}`)
-    return { ...requestConfig, reasoningEffort: effort }
+      const capability = capabilityFor(current.provider, current.model)
+      if (capability === null) {
+        warmModel(current.provider, current.model).catch(() => {})
+        return
+      }
+      if (capability.error !== null || capability.ladder.length === 0) {
+        record(key, rowFor(judgment, null, text, current.provider, current.model, 'unsupported'))
+        claim.bestScore = judgment.score
+        sessionState.set(key, { score: judgment.score, task: clipTask(text, judgeConfig.maxChars), turn })
+        return
+      }
+
+      const selection = chooseEffortForScore(judgment.score, capability.ladder, { includeOff: cfg.includeOff === true })
+      if (selection === null) {
+        record(key, rowFor(judgment, null, text, current.provider, current.model, 'no-matching-effort'))
+        claim.bestScore = judgment.score
+        return
+      }
+
+      if (cfg.respectExplicit === true) {
+        const recorded = typeof model.recordedSelection === 'function' ? model.recordedSelection() : null
+        const recordedEffort = recorded !== null && recorded !== undefined ? recorded.reasoningEffort : undefined
+        if (recordedEffort !== undefined) {
+          const previous = lastApplied.get(key)
+          const ours = previous !== undefined
+            && previous.effort === recordedEffort
+            && previous.provider === current.provider
+            && previous.model === current.model
+          if (!ours) {
+            record(key, rowFor(judgment, selectionForEffort(recordedEffort, capability), text, current.provider, current.model, 'explicit'))
+            claim.bestScore = judgment.score
+            return
+          }
+        }
+      }
+
+      model.select({
+        provider: current.provider,
+        model: current.model,
+        reasoningEffort: selection.effort,
+      })
+      lastApplied.set(key, { effort: selection.effort, provider: current.provider, model: current.model })
+      claim.bestScore = judgment.score
+      sessionState.set(key, { score: judgment.score, task: clipTask(text, judgeConfig.maxChars), turn, effort: selection.effort, provider: current.provider, model: current.model })
+      record(key, rowFor(judgment, selection, text, current.provider, current.model, ''))
+      log(`turn ${turn} score ${judgment.score} (${judgment.triggered_by})`
+        + ` -> ${selection.effort} [${selection.index + 1}/${selection.count}] on ${current.provider}/${current.model}`)
+    } catch (error) {
+      log(`claim handler failed: ${error.message}`, 'warn')
+    }
   }, { global: useGlobal })
 
   function modelIndex() {
@@ -692,12 +980,17 @@ export function apply(ctx, config) {
         const sessions = only !== null && only !== ''
           ? (state.sessions[only] === undefined ? {} : { [only]: state.sessions[only] })
           : state.sessions
+        const last = state.last
         json(res, 200, {
           mode: mode.value,
-          tier: state.last === null ? null : state.last.tier,
-          effort: state.last === null ? null : state.last.effort,
+          tier: last === null ? null : last.tier,
+          score: last === null ? null : last.score,
+          effort: last === null ? null : last.effort,
+          levelIndex: last === null ? null : last.levelIndex,
+          levelCount: last === null ? null : last.levelCount,
+          ladder: last === null ? null : last.ladder,
           updatedAt: state.updatedAt,
-          last: state.last,
+          last,
           sessions,
           models: modelIndex(),
         })
@@ -793,12 +1086,13 @@ export function apply(ctx, config) {
     }))
   })
 
-  log(`mounted (mode ${mode.value}); per-turn effort routing on the request's own model`)
-  log('tiers low/high/max prefer low/medium, high, and max/xhigh when the model declares them')
+  warmAll().catch((error) => log(`initial warm-up failed: ${error.message}`, 'warn'))
+  log(`mounted (mode ${mode.value}); score-driven effort routing on the turn's own model`)
+  log('effort ladder = the current model reasoning.efforts, divided by its declared count')
   if (cfg.respectExplicit === true) {
-    log('respectExplicit is on: a request that already carries reasoningEffort is left untouched, including the agent default')
+    log('respectExplicit is on: a user/delegated explicit reasoningEffort is left untouched')
   }
   if (typeof cfg.judgeUrl === 'string' && cfg.judgeUrl !== '' && !/^https:/i.test(cfg.judgeUrl)) {
-    log(`judgeUrl is not https: the task text (up to ${judgeConfig.judgeMaxChars} chars) will be sent in clear text to ${cfg.judgeUrl}`, 'warn')
+    log(`judgeUrl is not https: the task text (up to ${judgeConfig.maxChars} chars) will be sent in clear text to ${cfg.judgeUrl}`, 'warn')
   }
 }

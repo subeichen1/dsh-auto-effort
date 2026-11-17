@@ -1,6 +1,6 @@
 {
   "name": "dsh-auto-effort",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Per-turn thinking-effort routing that keeps the current model, including Magpie and other third-party providers",
   "type": "module",
   "main": "index.js",

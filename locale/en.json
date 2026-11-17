@@ -4,16 +4,6 @@
     "description": "Sets the reasoning effort of every request from the task at hand while keeping the current model, including third-party models such as Magpie."
   },
   "ui": {
-    "tier": {
-      "low": "AUTO · LOW",
-      "high": "AUTO · HIGH",
-      "max": "AUTO · MAX",
-      "short": {
-        "low": "LOW",
-        "high": "HIGH",
-        "max": "MAX"
-      }
-    },
     "state": {
       "offline": "AUTO · offline",
       "pending": "AUTO · pending",
@@ -32,8 +22,6 @@
       "global": "global switch, applies to every session"
     },
     "hint": {
-      "raised": "This model bottoms out at {effort}",
-      "capped": "This model tops out at {effort}",
       "deferred": "This request already carries reasoningEffort={effort}; respectExplicit leaves it alone",
       "writeError": "Switch failed: the host refused the write (cross-site or non-JSON). Restoring in 3s",
       "offline": "Auto thinking effort: host route unreachable",
@@ -41,7 +29,9 @@
       "pending": "Auto · waiting for this turn's verdict",
       "auto": "Auto · click to switch to manual",
       "noEffort": "This model declares no reasoning effort",
-      "turn": "This turn {tier} → {effort}",
+      "turn": "This turn {score}/100 → {effort}",
+      "level": "Level {index} of {count} declared by this model",
+      "ladder": "Levels: {ladder}",
       "model": "{provider}/{model}"
     },
     "cell": {
